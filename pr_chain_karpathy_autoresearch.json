@@ -1,0 +1,112 @@
+{
+  "chain": [
+    {
+      "sha": "c12eef778edafc89cd7ce036a7f500ddb5397a65",
+      "type": "base"
+    },
+    {
+      "api_base_ref": "master",
+      "api_base_sha": "068d93da75aa45f72ba482046f108241aaaf1b8e",
+      "api_head_ref": "fix/nan-loss-fast-fail",
+      "api_head_sha": "ebf357841b7358ae106b2f7ac378f9ec97b975f6",
+      "body": "The fast-fail check `train_loss_f > 100` silently passes on NaN because IEEE 754 NaN comparisons always return False. When an agent experiment produces NaN (e.g. from an aggressive LR change), the run wastes the full 5-minute budget training on garbage instead of aborting immediately.\n\n`not (x <= 100)` is the standard negated-comparison idiom that catches both >100 and NaN, with no added complexity.",
+      "commits": [
+        {
+          "author_date": "2026-03-09T15:51:02Z",
+          "message": "fix NaN loss not caught by fast-fail check\n\n`train_loss_f > 100` silently passes on NaN because IEEE 754 NaN\ncomparisons always return False. When an agent experiment produces\nNaN (e.g. from an aggressive LR change), the run wastes the full\n5-minute budget instead of failing fast.\n\n`not (x <= 100)` catches both >100 and NaN with no added complexity.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+          "parents": [
+            "068d93da75aa45f72ba482046f108241aaaf1b8e"
+          ],
+          "sha": "b5ba8ac00d64d38fd5b69714fe398b61c56d8160"
+        },
+        {
+          "author_date": "2026-03-11T04:28:08Z",
+          "message": "fix(train): make NaN fast-fail check explicit",
+          "parents": [
+            "b5ba8ac00d64d38fd5b69714fe398b61c56d8160"
+          ],
+          "sha": "ebf357841b7358ae106b2f7ac378f9ec97b975f6"
+        }
+      ],
+      "created_at": "2026-03-09T15:51:16Z",
+      "mainline_parent_sha": "c12eef778edafc89cd7ce036a7f500ddb5397a65",
+      "merge_commit_author_date": "2026-03-11T05:31:43Z",
+      "merge_commit_committer_date": "2026-03-11T05:31:43Z",
+      "merge_commit_message": "fix NaN loss not caught by fast-fail check",
+      "merge_commit_parents": [
+        "c12eef778edafc89cd7ce036a7f500ddb5397a65",
+        "ebf357841b7358ae106b2f7ac378f9ec97b975f6"
+      ],
+      "merge_commit_sha": "0be1e4fdf9882ea3b387ff432f2547246fc556bc",
+      "merged_at": "2026-03-11T05:31:43Z",
+      "pr_number": 84,
+      "title": "fix NaN loss not caught by fast-fail check",
+      "type": "pr"
+    },
+    {
+      "api_base_ref": "master",
+      "api_base_sha": "c12eef778edafc89cd7ce036a7f500ddb5397a65",
+      "api_head_ref": "refactor-infinite-loop",
+      "api_head_sha": "09ebea439db47bf08f925fc1654dc30415a58c64",
+      "body": "Add assertion after filtering val_path from parquet_paths for the \"train\" split so an empty list fails fast instead of spinning in a silent infinite loop.\r\n\r\nAlso remove stray article \"a\" in README (\"a three files\" → \"three files\").",
+      "commits": [
+        {
+          "author_date": "2026-03-11T03:34:40Z",
+          "message": "Guard against infinite loop when no training shards exist, fix README typo\n\nAdd assertion after filtering val_path from parquet_paths for the \"train\"\nsplit so an empty list fails fast instead of spinning in a silent infinite\nloop. Also remove stray article \"a\" in README (\"a three files\" → \"three\nfiles\").\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+          "parents": [
+            "c12eef778edafc89cd7ce036a7f500ddb5397a65"
+          ],
+          "sha": "09ebea439db47bf08f925fc1654dc30415a58c64"
+        }
+      ],
+      "created_at": "2026-03-11T03:35:55Z",
+      "mainline_parent_sha": "0be1e4fdf9882ea3b387ff432f2547246fc556bc",
+      "merge_commit_author_date": "2026-03-11T05:32:17Z",
+      "merge_commit_committer_date": "2026-03-11T05:32:17Z",
+      "merge_commit_message": "Guard against infinite loop when no training shards exist, fix README typo",
+      "merge_commit_parents": [
+        "0be1e4fdf9882ea3b387ff432f2547246fc556bc",
+        "09ebea439db47bf08f925fc1654dc30415a58c64"
+      ],
+      "merge_commit_sha": "c2450add72cc80317be1fe8111974b892da10944",
+      "merged_at": "2026-03-11T05:32:17Z",
+      "pr_number": 162,
+      "title": "Guard against infinite loop when no training shards exist, fix README typo",
+      "type": "pr"
+    },
+    {
+      "api_base_ref": "master",
+      "api_base_sha": "c2450add72cc80317be1fe8111974b892da10944",
+      "api_head_ref": "master",
+      "api_head_sha": "513fe6fceef9b37b6c24c8dc0f1050dee451c1ff",
+      "body": "",
+      "commits": [
+        {
+          "author_date": "2026-03-16T18:28:48Z",
+          "message": "add AMD ROCm fork to notable forks section",
+          "parents": [
+            "c2450add72cc80317be1fe8111974b892da10944"
+          ],
+          "sha": "513fe6fceef9b37b6c24c8dc0f1050dee451c1ff"
+        }
+      ],
+      "created_at": "2026-03-16T18:29:31Z",
+      "mainline_parent_sha": "c2450add72cc80317be1fe8111974b892da10944",
+      "merge_commit_author_date": "2026-03-16T18:43:26Z",
+      "merge_commit_committer_date": "2026-03-16T18:43:26Z",
+      "merge_commit_message": "Merge pull request #301 from indianspeedster/master\n\nadd AMD ROCm fork to notable forks section",
+      "merge_commit_parents": [
+        "c2450add72cc80317be1fe8111974b892da10944",
+        "513fe6fceef9b37b6c24c8dc0f1050dee451c1ff"
+      ],
+      "merge_commit_sha": "32a1460f626e28479d427c033ee485bf5f86875a",
+      "merged_at": "2026-03-16T18:43:26Z",
+      "pr_number": 301,
+      "title": "add AMD ROCm fork to notable forks section",
+      "type": "pr"
+    }
+  ],
+  "chain_length": 3,
+  "chain_type": "mainline_parent_based",
+  "repo": "karpathy/autoresearch"
+}

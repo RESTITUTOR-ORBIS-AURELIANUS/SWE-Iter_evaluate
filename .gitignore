@@ -1,0 +1,17 @@
+.venv/
+.DS_Store
+.idea/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.cache/
+results/
+*.pyc
+*.log
+.env
+.env.*
+config.local.yaml
+config.*.local.yaml
+config.yaml
+sweagent.config.yaml
+sweagent.*.local.yaml

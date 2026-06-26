@@ -1,0 +1,30 @@
+api:
+  github:
+    token: "FILL_YOUR_GITHUB_TOKEN_HERE"
+
+  deepseek_pro:
+    api_key: "FILL_YOUR_DEEPSEEK_V4_PRO_API_KEY_HERE"
+    base_url: "FILL_DEEPSEEK_PRO_BASE_URL_HERE"
+    model: "DeepSeek-V4-Pro"
+
+swe_agent:
+  # SWE-agent model credentials are not managed by this evaluator.
+  # Configure them in SWE-agent's own config file or provider environment variables.
+  command: "sweagent"
+  config_path: "FILL_YOUR_SWE_AGENT_CONFIG_PATH_HERE"
+  extra_args: []
+  timeout_seconds_per_step: 3600
+  apply_patch_locally: true
+
+  # Optional escape hatch for SWE-agent CLI variants. If set, this list replaces
+  # the default command assembly. Available placeholders:
+  # {command}, {config_path}, {model_worktree_path}, {problem_statement_path}
+  command_template: []
+
+scoring:
+  lambda_test: 0.5
+  gamma_time: 1.2
+  rho_evidence: 0.5
+  test_f2p_weight: 0.7
+  test_p2p_weight: 0.3
+  kappa_tests: 20
