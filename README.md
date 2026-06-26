@@ -5,7 +5,7 @@ engineering benchmark runs over mined GitHub PR chains.
 
 The evaluator supports Python repositories with pytest tests. It treats each
 merged PR in the input chain as one requirement iteration, calls an external
-SWE-agent CLI to generate code, runs file-level F2P/P2P tests, calls a
+SWE-agent CLI to generate code, runs case-level F2P/P2P tests, calls a
 DeepSeek V4 Pro compatible API for semantic PatchScore, and writes an
 IterScore report.
 
@@ -97,6 +97,13 @@ The output directory contains:
 requirements, GoldenPatch paths, F2P/P2P/P2F/F2F classifications, model patch
 paths, atomic requirements, step scores, and final IterScore.
 
+Test classifications and TestScore use pytest case/nodeid granularity, for
+example `tests/test_widget.py::test_new_behavior`. A PR step only contributes
+tests when it introduces new pytest nodeids compared with its mainline parent.
+If a step does not introduce new test cases, that step is scored as
+PatchScore-only instead of falling back to all repository tests; later steps
+that do introduce tests use the normal pytest + PatchScore path again.
+
 PatchScore aggregates only non-test, non-docs `must_have` atomic requirements.
 Atomic requirements with `type: test` or `type: docs` are retained in the result
 for audit and evidence context, but they do not penalize a code-generation agent
@@ -105,12 +112,13 @@ that was instructed not to modify tests or documentation.
 ## Current Limits
 
 - v1 only supports Python repositories.
-- v1 requires pytest-discoverable tests.
+- If tests are present, v1 requires them to be pytest-discoverable.
 - v1 exits on environment setup failure.
-- v1 uses file-level F2P/P2P classification.
+- v1 uses pytest case/nodeid-level F2P/P2P classification.
 - v1 uses SWE-agent for code generation and DeepSeek V4 Pro for semantic patch
   scoring.
-- v1 does not do patch-only fallback when tests, SWE-agent, or DeepSeek fail.
+- v1 uses PatchScore-only scoring for steps with no newly introduced pytest
+  cases; it does not use patch-only fallback when SWE-agent or DeepSeek fail.
 
 ## SWE-agent CLI Variants
 

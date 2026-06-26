@@ -3,7 +3,7 @@
 
 This is a formal first-pass implementation for Python repositories with pytest.
 It clones a repository, constructs iterative PR steps from a mined PR chain,
-classifies file-level tests, calls SWE-agent for code generation, and uses a
+classifies case-level tests, calls SWE-agent for code generation, and uses a
 DeepSeek/OpenAI-compatible API for semantic PatchScore judging.
 """
 
@@ -721,14 +721,85 @@ def discover_tests(repo_path: Path, log_path: Path) -> list[str]:
 
 def collect_test_files_from_pytest_output(output: str) -> list[str]:
     test_files: set[str] = set()
+    for node_id in collect_test_cases_from_pytest_output(output):
+        file_part = test_file_from_nodeid(node_id)
+        if file_part:
+            test_files.add(file_part)
+    return sorted(test_files)
+
+
+def collect_test_cases_from_pytest_output(output: str) -> list[str]:
+    test_cases: set[str] = set()
     for line in output.splitlines():
         node_id = line.strip()
         if "::" not in node_id:
             continue
-        file_part = node_id.split("::", 1)[0]
-        if file_part.endswith(".py"):
-            test_files.add(file_part)
-    return sorted(test_files)
+        file_part = test_file_from_nodeid(node_id)
+        if file_part:
+            test_cases.add(node_id)
+    return sorted(test_cases)
+
+
+def test_file_from_nodeid(nodeid: str) -> str:
+    file_part = nodeid.split("::", 1)[0]
+    return file_part if file_part.endswith(".py") else ""
+
+
+def normalize_pytest_nodeids(
+    repo_path: Path,
+    nodeids: Iterable[str],
+    test_targets: Iterable[str],
+) -> list[str]:
+    target_files = sorted(
+        {
+            test_file_from_nodeid(target) or target
+            for target in test_targets
+            if (test_file_from_nodeid(target) or target).endswith(".py")
+        }
+    )
+    basename_map: dict[str, list[str]] = {}
+    for test_file in target_files:
+        basename_map.setdefault(Path(test_file).name, []).append(test_file)
+
+    normalized: set[str] = set()
+    for nodeid in nodeids:
+        if "::" not in nodeid:
+            continue
+        file_part, rest = nodeid.split("::", 1)
+        if (repo_path / file_part).exists() or file_part in target_files:
+            normalized_file = file_part
+        else:
+            candidates = basename_map.get(Path(file_part).name, [])
+            normalized_file = candidates[0] if len(candidates) == 1 else file_part
+        normalized.add(f"{Path(normalized_file).as_posix()}::{rest}")
+    return sorted(normalized)
+
+
+def normalize_pytest_result_nodeids(
+    repo_path: Path,
+    results: dict[str, bool],
+    test_targets: Iterable[str],
+) -> dict[str, bool]:
+    output: dict[str, bool] = {}
+    for raw_nodeid, passed in results.items():
+        normalized_nodeids = normalize_pytest_nodeids(repo_path, [raw_nodeid], test_targets)
+        if normalized_nodeids:
+            output[normalized_nodeids[0]] = passed
+    return output
+
+
+def failed_pytest_targets_for_timeout(
+    repo_path: Path,
+    test_targets: Iterable[str],
+) -> dict[str, bool]:
+    failed: dict[str, bool] = {}
+    for target in test_targets:
+        if "::" in target:
+            normalized = normalize_pytest_nodeids(repo_path, [target], test_targets)
+            failed[normalized[0] if normalized else target] = False
+        else:
+            failed[target] = False
+    return failed
 
 
 def extract_missing_modules(output: str) -> set[str]:
@@ -956,15 +1027,83 @@ def clear_pycache_for(path: Path) -> None:
             pass
 
 
-def run_pytest_files(
+def parse_pytest_json_report(report_path: Path) -> dict[str, bool]:
+    if not report_path.exists():
+        return {}
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SWEIterError(f"Error: pytest JSON report is not valid JSON: {report_path}") from exc
+
+    results: dict[str, bool] = {}
+    for item in report.get("tests") or []:
+        if not isinstance(item, dict):
+            continue
+        nodeid = item.get("nodeid")
+        if not isinstance(nodeid, str) or "::" not in nodeid:
+            continue
+        results[nodeid] = item.get("outcome") == "passed"
+    return results
+
+
+def collect_pytest_cases(
     repo_path: Path,
     test_files: list[str],
     log_path: Path,
     overlay_sources: dict[str, bytes] | None = None,
     overlay_mode: str = "none",
-    timeout_per_file: int = 600,
-) -> dict[str, bool]:
+    timeout: int = 300,
+) -> list[str]:
     if not test_files:
+        return []
+    restore_data: dict[Path, bytes | None] = {}
+    overlay_sources = overlay_sources or {}
+
+    for rel_path, content in overlay_sources.items():
+        target = repo_path / rel_path
+        should_overlay = overlay_mode == "all" or (overlay_mode == "missing" and not target.exists())
+        if not should_overlay:
+            continue
+        if target not in restore_data:
+            restore_data[target] = target.read_bytes() if target.exists() else None
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        clear_pycache_for(target)
+
+    try:
+        existing = [test_file for test_file in test_files if (repo_path / test_file).exists()]
+        if not existing:
+            return []
+        proc = run_command(
+            [str(venv_python(repo_path)), "-m", "pytest", "--collect-only", "-q", *existing],
+            cwd=repo_path,
+            log_path=log_path,
+            check=False,
+            timeout=timeout,
+        )
+        combined = f"{proc.stdout}\n{proc.stderr}"
+        if proc.returncode != 0:
+            if pytest_environment_error(combined):
+                raise SWEIterError("Error: pytest environment/import error during collection.")
+            raise SWEIterError("Error: pytest collect failed for selected test files.")
+        return normalize_pytest_nodeids(
+            repo_path,
+            collect_test_cases_from_pytest_output(proc.stdout),
+            existing,
+        )
+    finally:
+        restore_overlay(restore_data)
+
+
+def run_pytest_files(
+    repo_path: Path,
+    test_targets: list[str],
+    log_path: Path,
+    overlay_sources: dict[str, bytes] | None = None,
+    overlay_mode: str = "none",
+    timeout_per_file: int = 60,
+) -> dict[str, bool]:
+    if not test_targets:
         return {}
     restore_data: dict[Path, bytes | None] = {}
     overlay_sources = overlay_sources or {}
@@ -982,25 +1121,50 @@ def run_pytest_files(
 
     results: dict[str, bool] = {}
     try:
-        for test_file in test_files:
-            if not (repo_path / test_file).exists():
-                raise SWEIterError(f"Error: pytest test file does not exist: {test_file}")
+        target_files: set[str] = set()
+        for test_target in test_targets:
+            file_part = test_file_from_nodeid(test_target) or test_target
+            if not file_part or not (repo_path / file_part).exists():
+                raise SWEIterError(f"Error: pytest test target does not exist: {test_target}")
+            target_files.add(file_part)
+
+        report_path = log_path.with_name(f"{log_path.stem}_pytest_report.json")
+        timeout = max(timeout_per_file, min(timeout_per_file * max(1, len(target_files)), 3600))
+        try:
             proc = run_command(
-                [str(venv_python(repo_path)), "-m", "pytest", test_file, "-q"],
+                [
+                    str(venv_python(repo_path)),
+                    "-m",
+                    "pytest",
+                    *test_targets,
+                    "-q",
+                    "--json-report",
+                    f"--json-report-file={report_path}",
+                ],
                 cwd=repo_path,
                 log_path=log_path,
                 check=False,
-                timeout=timeout_per_file,
+                timeout=timeout,
             )
-            combined = f"{proc.stdout}\n{proc.stderr}"
-            if proc.returncode == 0:
-                results[test_file] = True
-            elif proc.returncode == 1:
-                if pytest_environment_error(combined):
-                    raise SWEIterError(f"Error: pytest environment/import error in {test_file}.")
-                results[test_file] = False
-            else:
-                raise SWEIterError(f"Error: pytest crashed for {test_file}.")
+        except SWEIterError as exc:
+            if "command timed out" not in str(exc):
+                raise
+            append_log(
+                log_path,
+                f"Pytest timed out after {timeout}s; marking selected targets failed.",
+            )
+            results.update(failed_pytest_targets_for_timeout(repo_path, test_targets))
+            return results
+        combined = f"{proc.stdout}\n{proc.stderr}"
+        if proc.returncode in {0, 1}:
+            if pytest_environment_error(combined):
+                raise SWEIterError("Error: pytest environment/import error.")
+            parsed = parse_pytest_json_report(report_path)
+            if not parsed:
+                raise SWEIterError("Error: pytest produced no case-level results.")
+            results.update(normalize_pytest_result_nodeids(repo_path, parsed, test_targets))
+        else:
+            raise SWEIterError("Error: pytest crashed.")
     finally:
         restore_overlay(restore_data)
     return results
@@ -1012,29 +1176,32 @@ def classify_f2p_p2p_tests(
     all_test_files: list[str],
     logs_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, bytes]]:
-    if not all_test_files:
+    def empty_classification(reason: str) -> tuple[dict[str, Any], dict[str, bytes]]:
         return {
             "selected_test_files": [],
+            "selected_test_cases": [],
             "from_results": {},
             "to_results": {},
             "F2P": [],
             "P2P": [],
             "P2F": [],
             "F2F": [],
+            "test_selection_reason": reason,
         }, {}
 
-    collected_tests = set(all_test_files)
+    if not all_test_files:
+        return empty_classification("no_pytest_test_files")
+
     changed_test_files = step.patch_stats.get("test_changed_files") or []
-    selected = [test_file for test_file in changed_test_files if test_file in collected_tests]
+    selected = sorted({test_file for test_file in changed_test_files if is_test_path(test_file)})
     if not selected:
-        selected = all_test_files
+        return empty_classification("no_changed_test_files")
+
     selected_existing = [
         test_file for test_file in selected if git_file_exists(repo_path, step.to_commit, test_file)
     ]
     if not selected_existing:
-        raise SWEIterError(
-            f"Error: no selected tests exist at to_commit for PR #{step.pr_number}."
-        )
+        return empty_classification("no_changed_test_files_exist_at_to_commit")
 
     test_sources: dict[str, bytes] = {}
     for test_file in selected_existing:
@@ -1046,38 +1213,52 @@ def classify_f2p_p2p_tests(
     from_log = logs_dir / f"step_{step.step_id:03d}_from.log"
 
     checkout_commit(repo_path, step.to_commit, to_log)
-    to_results = run_pytest_files(repo_path, selected_existing, to_log)
+    to_cases = collect_pytest_cases(repo_path, selected_existing, to_log)
+
+    checkout_commit(repo_path, step.from_commit, from_log)
+    from_existing = [
+        test_file for test_file in selected_existing if git_file_exists(repo_path, step.from_commit, test_file)
+    ]
+    from_cases = collect_pytest_cases(repo_path, from_existing, from_log)
+    selected_cases = sorted(set(to_cases) - set(from_cases))
+    if not selected_cases:
+        return empty_classification("no_new_test_cases")
+
+    checkout_commit(repo_path, step.to_commit, to_log)
+    to_results = run_pytest_files(repo_path, selected_cases, to_log)
 
     checkout_commit(repo_path, step.from_commit, from_log)
     from_results = run_pytest_files(
         repo_path,
-        selected_existing,
+        selected_cases,
         from_log,
         overlay_sources=test_sources,
-        overlay_mode="missing",
+        overlay_mode="all",
     )
 
     buckets = {"F2P": [], "P2P": [], "P2F": [], "F2F": []}
-    for test_file in selected_existing:
-        from_pass = from_results[test_file]
-        to_pass = to_results[test_file]
+    for test_case in selected_cases:
+        from_pass = from_results[test_case]
+        to_pass = to_results[test_case]
         if not from_pass and to_pass:
-            buckets["F2P"].append(test_file)
+            buckets["F2P"].append(test_case)
         elif from_pass and to_pass:
-            buckets["P2P"].append(test_file)
+            buckets["P2P"].append(test_case)
         elif from_pass and not to_pass:
-            buckets["P2F"].append(test_file)
+            buckets["P2F"].append(test_case)
         else:
-            buckets["F2F"].append(test_file)
+            buckets["F2F"].append(test_case)
 
     return {
         "selected_test_files": selected_existing,
+        "selected_test_cases": selected_cases,
         "from_results": from_results,
         "to_results": to_results,
         "F2P": buckets["F2P"],
         "P2P": buckets["P2P"],
         "P2F": buckets["P2F"],
         "F2F": buckets["F2F"],
+        "test_selection_reason": "new_test_cases",
     }, test_sources
 
 
@@ -1924,7 +2105,8 @@ def run_model_cumulative_tests(
     if not selected:
         append_log(log_path, "No cumulative tests selected; skipping pytest run.")
         return {}
-    overlay = {test: test_sources[test] for test in selected if test in test_sources}
+    selected_files = {test_file_from_nodeid(test) for test in selected}
+    overlay = {test: test_sources[test] for test in selected_files if test in test_sources}
     return run_pytest_files(
         model_worktree,
         selected,
@@ -1939,8 +2121,19 @@ def write_results_json(path: Path, result: dict[str, Any]) -> None:
 
 
 def summary_test_mode(result: dict[str, Any], scores: dict[str, Any]) -> str:
-    if not result.get("all_test_files") or scores.get("test_score_unavailable"):
+    if not result.get("all_test_files"):
         return "PatchScore-only (no pytest test files found)"
+    if scores.get("test_score_unavailable"):
+        reason = scores.get("test_score_unavailable_reason")
+        if reason in {
+            "no_new_test_cases",
+            "no_changed_test_files",
+            "no_changed_test_files_exist_at_to_commit",
+        }:
+            return "PatchScore-only (no new pytest test cases for this step)"
+        if reason == "no_scored_reference_test_cases":
+            return "PatchScore-only (new tests did not yield scored F2P/P2P cases)"
+        return "PatchScore-only"
     return "pytest + PatchScore"
 
 
@@ -1954,6 +2147,7 @@ def write_summary_md(path: Path, result: dict[str, Any]) -> None:
         f"- Final commit: `{result.get('final_commit')}`",
         f"- IterScore: `{result.get('IterScore')}`",
         f"- Test files discovered: `{len(result.get('all_test_files') or [])}`",
+        "- TestScore granularity: `pytest case/nodeid`",
     ]
     if not result.get("all_test_files"):
         lines.append("- Evaluation mode: `PatchScore-only (no pytest test files found)`")
@@ -1969,7 +2163,7 @@ def write_summary_md(path: Path, result: dict[str, Any]) -> None:
                 "",
                 f"- Title: {requirement.get('title', '')}",
                 f"- Requirement source: {requirement.get('source', '')}",
-                f"- F2P/P2P: {len(tests.get('F2P', []))}/{len(tests.get('P2P', []))}",
+                f"- F2P/P2P cases: {len(tests.get('F2P', []))}/{len(tests.get('P2P', []))}",
                 f"- Test mode: `{summary_test_mode(result, scores)}`",
                 f"- TestScore: `{scores.get('TestScore')}`",
                 f"- PatchScore: `{scores.get('PatchScore')}`",
@@ -2130,14 +2324,15 @@ def run_evaluation(
         cumulative_p2p.update(step.tests.get("P2P", []))
         cumulative_tests = cumulative_f2p | cumulative_p2p
         model_test_log = paths.logs / f"step_{step.step_id:03d}_model_tests.log"
-        has_cumulative_tests = bool(cumulative_tests)
-        model_test_results = run_model_cumulative_tests(
-            model_worktree,
-            cumulative_tests,
-            cumulative_test_sources,
-            model_test_log,
-        )
-        if has_cumulative_tests:
+        has_new_test_cases = bool(step.tests.get("selected_test_cases"))
+        has_scored_tests = bool(cumulative_tests)
+        if has_new_test_cases and has_scored_tests:
+            model_test_results = run_model_cumulative_tests(
+                model_worktree,
+                cumulative_tests,
+                cumulative_test_sources,
+                model_test_log,
+            )
             test_score, test_score_details = compute_test_score(
                 model_test_results,
                 cumulative_f2p,
@@ -2146,13 +2341,21 @@ def run_evaluation(
                 p2p_weight=float(config["scoring"]["test_p2p_weight"]),
             )
         else:
+            if has_new_test_cases:
+                reason = "no_scored_reference_test_cases"
+            elif not all_test_files:
+                reason = "no_pytest_test_files"
+            else:
+                reason = str(step.tests.get("test_selection_reason") or "no_new_test_cases")
+            model_test_results = {}
             test_score = None
             test_score_details = {
                 "f2p_pass_rate": None,
                 "p2p_pass_rate": None,
-                "cumulative_f2p_count": 0,
-                "cumulative_p2p_count": 0,
+                "cumulative_f2p_count": len(cumulative_f2p),
+                "cumulative_p2p_count": len(cumulative_p2p),
                 "test_score_unavailable": True,
+                "test_score_unavailable_reason": reason,
             }
 
         model_cumulative_patch = collect_model_cumulative_diff(

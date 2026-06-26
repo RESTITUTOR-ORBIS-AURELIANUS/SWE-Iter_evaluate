@@ -5,3 +5,4 @@ tenacity
 rich
 unidiff
 pytest
+pytest-json-report

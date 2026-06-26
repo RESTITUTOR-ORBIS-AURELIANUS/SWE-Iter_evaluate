@@ -4,6 +4,7 @@ import sys
 
 import pytest
 
+import swe_iter_eval
 from swe_iter_eval import (
     PRStep,
     RuntimePaths,
@@ -14,6 +15,7 @@ from swe_iter_eval import (
     classify_file_stats,
     coerce_no_source_requirement_types,
     collect_model_cumulative_diff,
+    collect_test_cases_from_pytest_output,
     collect_test_files_from_pytest_output,
     commit_model_step,
     compute_patch_score,
@@ -27,6 +29,7 @@ from swe_iter_eval import (
     is_source_path,
     is_test_path,
     namespace_atomic_requirements,
+    normalize_pytest_nodeids,
     poetry_lock_pinned_requirements,
     pyproject_dependency_names,
     run_model_cumulative_tests,
@@ -35,6 +38,29 @@ from swe_iter_eval import (
     submission_patches_from_trajectories,
     write_summary_md,
 )
+
+
+def write_python_proxy_venv(repo_path):
+    python_bin = repo_path / ".venv" / "bin" / "python"
+    python_bin.parent.mkdir(parents=True)
+    python_bin.write_text(f"#!/bin/sh\nexec {json.dumps(sys.executable)} \"$@\"\n", encoding="utf-8")
+    python_bin.chmod(0o755)
+
+
+def git(repo_path, *args):
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo_path,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+
+def commit_all(repo_path, message):
+    git(repo_path, "add", ".")
+    git(repo_path, "commit", "-m", message)
+    return git(repo_path, "rev-parse", "HEAD").stdout.strip()
 
 
 def test_path_classification():
@@ -108,6 +134,31 @@ tests/test_tree.py::test_render_ascii
     ]
 
 
+def test_collect_test_cases_from_pytest_output_keeps_nodeids():
+    output = """
+tests/test_card.py::test_card_render[param]
+tests/test_tree.py::TestTree::test_render_ascii
+2 tests collected in 0.17s
+"""
+    assert collect_test_cases_from_pytest_output(output) == [
+        "tests/test_card.py::test_card_render[param]",
+        "tests/test_tree.py::TestTree::test_render_ascii",
+    ]
+
+
+def test_normalize_pytest_nodeids_restores_selected_test_directory(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_syntax.py").write_text(
+        "def test_case():\n    assert True\n",
+        encoding="utf-8",
+    )
+    assert normalize_pytest_nodeids(
+        tmp_path,
+        ["test_syntax.py::test_case"],
+        ["tests/test_syntax.py"],
+    ) == ["tests/test_syntax.py::test_case"]
+
+
 def test_discover_tests_returns_empty_for_repo_without_tests(tmp_path):
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'sample'\nversion = '0.1.0'\n", encoding="utf-8")
     assert discover_tests(tmp_path, tmp_path / "collect.log") == []
@@ -117,17 +168,53 @@ def test_run_pytest_files_returns_empty_when_no_tests_selected(tmp_path):
     assert run_pytest_files(tmp_path, [], tmp_path / "pytest.log") == {}
 
 
+def test_run_pytest_files_returns_case_level_results(tmp_path):
+    write_python_proxy_venv(tmp_path)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_cases.py").write_text(
+        "def test_passes():\n    assert True\n\n"
+        "def test_fails():\n    assert False\n",
+        encoding="utf-8",
+    )
+
+    assert run_pytest_files(
+        tmp_path,
+        ["tests/test_cases.py"],
+        tmp_path / "pytest.log",
+    ) == {
+        "tests/test_cases.py::test_fails": False,
+        "tests/test_cases.py::test_passes": True,
+    }
+
+
+def test_run_pytest_files_marks_timeout_targets_failed(tmp_path, monkeypatch):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_timeout.py").write_text(
+        "def test_hangs():\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    def fake_run_command(*args, **kwargs):
+        raise SWEIterError("Error: command timed out after 60s: pytest")
+
+    monkeypatch.setattr(swe_iter_eval, "run_command", fake_run_command)
+
+    assert run_pytest_files(
+        tmp_path,
+        ["tests/test_timeout.py::test_hangs"],
+        tmp_path / "pytest.log",
+    ) == {"tests/test_timeout.py::test_hangs": False}
+
+
 def test_run_model_cumulative_tests_returns_empty_when_no_tests_selected(tmp_path):
     assert run_model_cumulative_tests(tmp_path, set(), {}, tmp_path / "model_tests.log") == {}
 
 
 def test_model_cumulative_tests_use_only_incremental_test_sources(tmp_path):
-    python_bin = tmp_path / ".venv" / "bin" / "python"
-    python_bin.parent.mkdir(parents=True)
-    python_bin.write_text(f"#!/bin/sh\nexec {json.dumps(sys.executable)} \"$@\"\n", encoding="utf-8")
-    python_bin.chmod(0o755)
+    write_python_proxy_venv(tmp_path)
 
     test_file = "tests/test_future.py"
+    test_case = f"{test_file}::test_current_step"
     step1 = PRStep(
         step_id=1,
         pr_number=1,
@@ -143,18 +230,19 @@ def test_model_cumulative_tests_use_only_incremental_test_sources(tmp_path):
     cumulative_sources.update(step1.test_sources)
     assert run_model_cumulative_tests(
         tmp_path,
-        {test_file},
+        {test_case},
         cumulative_sources,
         tmp_path / "step1.log",
-    ) == {test_file: True}
+    ) == {test_case: True}
 
     cumulative_sources.update(step2.test_sources)
+    test_case = f"{test_file}::test_future_step"
     assert run_model_cumulative_tests(
         tmp_path,
-        {test_file},
+        {test_case},
         cumulative_sources,
         tmp_path / "step2.log",
-    ) == {test_file: False}
+    ) == {test_case: False}
 
 
 def test_classify_f2p_p2p_tests_returns_empty_when_no_tests_available(tmp_path):
@@ -162,13 +250,144 @@ def test_classify_f2p_p2p_tests_returns_empty_when_no_tests_available(tmp_path):
     tests, sources = classify_f2p_p2p_tests(tmp_path, step, [], tmp_path)
     assert tests == {
         "selected_test_files": [],
+        "selected_test_cases": [],
         "from_results": {},
         "to_results": {},
         "F2P": [],
         "P2P": [],
         "P2F": [],
         "F2F": [],
+        "test_selection_reason": "no_pytest_test_files",
     }
+    assert sources == {}
+
+
+def test_classify_f2p_p2p_tests_selects_new_cases_only(tmp_path):
+    git(tmp_path, "init")
+    git(tmp_path, "config", "user.email", "test@example.com")
+    git(tmp_path, "config", "user.name", "Test User")
+    (tmp_path / "app.py").write_text("def ok():\n    return False\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_widget.py").write_text(
+        "def test_existing():\n    assert True\n",
+        encoding="utf-8",
+    )
+    base = commit_all(tmp_path, "base")
+
+    (tmp_path / "app.py").write_text("def ok():\n    return True\n", encoding="utf-8")
+    (tmp_path / "tests" / "test_widget.py").write_text(
+        "import app\n\n"
+        "def test_existing():\n    assert True\n\n"
+        "def test_new_case():\n    assert app.ok()\n",
+        encoding="utf-8",
+    )
+    head = commit_all(tmp_path, "add new test")
+    write_python_proxy_venv(tmp_path)
+
+    step = PRStep(
+        step_id=1,
+        pr_number=5,
+        from_commit=base,
+        to_commit=head,
+        patch_stats=classify_file_stats(
+            [
+                {"filename": "app.py", "additions": 1, "deletions": 1},
+                {"filename": "tests/test_widget.py", "additions": 4, "deletions": 0},
+            ]
+        ),
+    )
+    tests, sources = classify_f2p_p2p_tests(
+        tmp_path,
+        step,
+        ["tests/test_widget.py"],
+        tmp_path / "logs",
+    )
+
+    new_case = "tests/test_widget.py::test_new_case"
+    assert tests["selected_test_cases"] == [new_case]
+    assert tests["F2P"] == [new_case]
+    assert tests["P2P"] == []
+    assert tests["from_results"] == {new_case: False}
+    assert tests["to_results"] == {new_case: True}
+    assert sorted(sources) == ["tests/test_widget.py"]
+
+
+def test_classify_f2p_p2p_tests_does_not_fallback_to_all_tests_without_new_cases(tmp_path):
+    git(tmp_path, "init")
+    git(tmp_path, "config", "user.email", "test@example.com")
+    git(tmp_path, "config", "user.name", "Test User")
+    (tmp_path / "app.py").write_text("def ok():\n    return False\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_widget.py").write_text(
+        "def test_existing():\n    assert True\n",
+        encoding="utf-8",
+    )
+    base = commit_all(tmp_path, "base")
+
+    (tmp_path / "app.py").write_text("def ok():\n    return True\n", encoding="utf-8")
+    head = commit_all(tmp_path, "code only")
+
+    step = PRStep(
+        step_id=1,
+        pr_number=6,
+        from_commit=base,
+        to_commit=head,
+        patch_stats=classify_file_stats(
+            [{"filename": "app.py", "additions": 1, "deletions": 1}]
+        ),
+    )
+    tests, sources = classify_f2p_p2p_tests(
+        tmp_path,
+        step,
+        ["tests/test_widget.py"],
+        tmp_path / "logs",
+    )
+
+    assert tests["selected_test_files"] == []
+    assert tests["selected_test_cases"] == []
+    assert tests["test_selection_reason"] == "no_changed_test_files"
+    assert tests["F2P"] == []
+    assert tests["P2P"] == []
+    assert sources == {}
+
+
+def test_classify_f2p_p2p_tests_changed_file_without_new_case_is_patch_only(tmp_path):
+    git(tmp_path, "init")
+    git(tmp_path, "config", "user.email", "test@example.com")
+    git(tmp_path, "config", "user.name", "Test User")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_widget.py").write_text(
+        "def test_existing():\n    assert True\n",
+        encoding="utf-8",
+    )
+    base = commit_all(tmp_path, "base")
+
+    (tmp_path / "tests" / "test_widget.py").write_text(
+        "def test_existing():\n    assert 1 == 1\n",
+        encoding="utf-8",
+    )
+    head = commit_all(tmp_path, "modify existing test")
+    write_python_proxy_venv(tmp_path)
+
+    step = PRStep(
+        step_id=1,
+        pr_number=7,
+        from_commit=base,
+        to_commit=head,
+        patch_stats=classify_file_stats(
+            [{"filename": "tests/test_widget.py", "additions": 1, "deletions": 1}]
+        ),
+    )
+    tests, sources = classify_f2p_p2p_tests(
+        tmp_path,
+        step,
+        ["tests/test_widget.py"],
+        tmp_path / "logs",
+    )
+
+    assert tests["selected_test_files"] == []
+    assert tests["selected_test_cases"] == []
+    assert tests["test_selection_reason"] == "no_new_test_cases"
     assert sources == {}
 
 
